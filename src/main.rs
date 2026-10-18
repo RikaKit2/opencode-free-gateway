@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -12,11 +11,10 @@ use axum::{Json, Router};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::process::Command;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug, Clone)]
@@ -31,24 +29,17 @@ struct Args {
     #[arg(short, long, default_value_t = 4006, env = "GATEWAY_PORT")]
     port: u16,
 
-    #[arg(long, default_value_t = 4096, env = "OPENCODE_SERVE_PORT")]
-    opencode_serve_port: u16,
-
     #[arg(
         long,
         default_value = "/run/current-system/sw/bin/opencode",
         env = "OPENCODE_BIN"
     )]
     opencode_bin: String,
-
-    #[arg(long, default_value_t = false, env = "NO_SUPERVISOR")]
-    no_supervisor: bool,
 }
 
 #[derive(Clone)]
 struct AppState {
     args: Args,
-    server_healthy: Arc<RwLock<bool>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -212,80 +203,6 @@ fn build_prompt(messages: &[ChatMessage]) -> String {
     full
 }
 
-async fn check_opencode_serve(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/api/model", port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build();
-    if let Ok(c) = client {
-        if let Ok(res) = c.get(&url).send().await {
-            return res.status().is_success();
-        }
-    }
-    false
-}
-
-fn spawn_opencode_serve(bin_path: &str, port: u16) -> Result<Child, std::io::Error> {
-    info!(target: "supervisor", "Spawning background opencode serve on port {}", port);
-    Command::new(bin_path)
-        .arg("serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--hostname")
-        .arg("127.0.0.1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-}
-
-async fn supervisor_loop(
-    bin_path: String,
-    serve_port: u16,
-    healthy_flag: Arc<RwLock<bool>>,
-    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-) {
-    let mut child: Option<Child> = None;
-
-    loop {
-        let is_healthy = check_opencode_serve(serve_port).await;
-        {
-            let mut lock = healthy_flag.write().await;
-            *lock = is_healthy;
-        }
-
-        if !is_healthy {
-            if child.is_none() {
-                match spawn_opencode_serve(&bin_path, serve_port) {
-                    Ok(c) => {
-                        child = Some(c);
-                        info!(target: "supervisor", "opencode serve process started.");
-                    }
-                    Err(e) => {
-                        error!(target: "supervisor", "Failed to spawn opencode serve: {}", e);
-                    }
-                }
-            } else if let Some(c) = &mut child {
-                if let Ok(Some(status)) = c.try_wait() {
-                    warn!(target: "supervisor", "opencode serve exited with status: {}. Restarting in 2s...", status);
-                    child = None;
-                }
-            }
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-            _ = shutdown_rx.recv() => {
-                info!(target: "supervisor", "Shutting down opencode serve supervisor...");
-                if let Some(mut c) = child {
-                    let _ = c.kill().await;
-                }
-                break;
-            }
-        }
-    }
-}
-
 async fn list_models() -> Json<ModelListResponse> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -320,37 +237,23 @@ async fn handle_chat(
 ) -> Result<Response, (StatusCode, String)> {
     let model_id = normalize_model(&req.model);
     let prompt = build_prompt(&req.messages);
-    let is_serve_healthy = *state.server_healthy.read().await;
 
     let mut cmd = Command::new(&state.args.opencode_bin);
     cmd.kill_on_drop(true);
+    cmd.current_dir("/tmp");
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    if is_serve_healthy {
-        cmd.arg("run")
-            .arg("--attach")
-            .arg(format!(
-                "http://127.0.0.1:{}",
-                state.args.opencode_serve_port
-            ))
-            .arg("--format")
-            .arg("json")
-            .arg("-m")
-            .arg(&model_id)
-            .arg(&prompt);
-    } else {
-        cmd.arg("run")
-            .arg("--pure")
-            .arg("--dir")
-            .arg("/tmp")
-            .arg("--format")
-            .arg("json")
-            .arg("-m")
-            .arg(&model_id)
-            .arg(&prompt);
-    }
+    cmd.arg("run")
+        .arg("--pure")
+        .arg("--dir")
+        .arg("/tmp")
+        .arg("--format")
+        .arg("json")
+        .arg("-m")
+        .arg(&model_id)
+        .arg(&prompt);
 
     let mut child = cmd.spawn().map_err(|e| {
         (
@@ -524,22 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-    let server_healthy = Arc::new(RwLock::new(false));
-
-    if !args.no_supervisor {
-        tokio::spawn(supervisor_loop(
-            args.opencode_bin.clone(),
-            args.opencode_serve_port,
-            server_healthy.clone(),
-            shutdown_rx,
-        ));
-    }
-
-    let state = AppState {
-        args: args.clone(),
-        server_healthy,
-    };
+    let state = AppState { args: args.clone() };
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -559,7 +447,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(async move {
             tokio::signal::ctrl_c().await.ok();
             info!(target: "gateway", "Shutdown signal received.");
-            let _ = shutdown_tx.send(());
         })
         .await?;
 
