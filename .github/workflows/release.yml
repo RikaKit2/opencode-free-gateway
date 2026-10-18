@@ -1,0 +1,91 @@
+name: Release & CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish as GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Audit, Lint & Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  build-release:
+    name: Build Release Binary
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release assets
+        run: |
+          PKG_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="opencode-free-gateway") | "v" + .version')
+          VERSION="${{ github.ref_name }}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ] || [ "$VERSION" = "master" ]; then
+            VERSION="$PKG_VERSION"
+          fi
+
+          echo "Packaging version: ${VERSION}"
+          sha256sum target/release/opencode-free-gateway > target/release/opencode-free-gateway.sha256
+
+          ARCHIVE_NAME="opencode-free-gateway-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -czvf "${ARCHIVE_NAME}" -C target/release opencode-free-gateway
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-free-gateway-linux-x86_64
+          path: |
+            target/release/opencode-free-gateway
+            target/release/opencode-free-gateway.sha256
+
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/opencode-free-gateway
+            target/release/opencode-free-gateway.sha256
+            opencode-free-gateway-*-x86_64-unknown-linux-gnu.tar.gz
+            opencode-free-gateway-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
